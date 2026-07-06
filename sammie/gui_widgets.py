@@ -342,7 +342,51 @@ class PointTable(QTableWidget):
         
         # Add delete button in the last column
         self._add_delete_button(row_count)
-        
+
+        self.scrollToBottom()
+
+    def add_box(self, frame, object_id, x1, y1, x2, y2):
+        """Add a new box to the table"""
+        settings_mgr = get_settings_manager()
+        show_all_points = settings_mgr.get_session_setting("show_all_points", True)
+
+        if not show_all_points and frame != self.current_frame:
+            return
+
+        row_count = self.rowCount()
+        self.insertRow(row_count)
+
+        # Frame
+        self.setItem(row_count, 0, QTableWidgetItem(str(frame)))
+
+        # Object ID (colored widget)
+        colored_widget = self._create_colored_object_id_widget(object_id)
+        self.setCellWidget(row_count, 1, colored_widget)
+
+        # Type: box icon (□)
+        type_item = QTableWidgetItem()
+        type_item.setText("□")
+        type_item.setToolTip("Box prompt")
+        self.setItem(row_count, 2, type_item)
+
+        # X column: show x1,y1
+        self.setItem(row_count, 3, QTableWidgetItem(f"{x1},{y1}"))
+
+        # Y column: show x2,y2
+        self.setItem(row_count, 4, QTableWidgetItem(f"{x2},{y2}"))
+
+        # Store box data in item UserRole for delete handling
+        frame_item = self.item(row_count, 0)
+        frame_item.setData(Qt.UserRole + 1, "box")  # Mark as box row
+        frame_item.setData(Qt.UserRole + 2, object_id)
+        frame_item.setData(Qt.UserRole + 3, x1)
+        frame_item.setData(Qt.UserRole + 4, y1)
+        frame_item.setData(Qt.UserRole + 5, x2)
+        frame_item.setData(Qt.UserRole + 6, y2)
+
+        # Add delete button
+        self._add_delete_button(row_count)
+
         self.scrollToBottom()
     
     def set_current_frame(self, frame):
@@ -390,21 +434,24 @@ class PointTable(QTableWidget):
         # Block signals to prevent selection changes during deletion
         self.blockSignals(True)
 
-        # Batch remove all points first
+        # Batch remove all points/boxes first
         removed_points = []
         affected_frames = set()  # Track which frames need mask regeneration
         for row in rows:
             if row >= self.rowCount():
                 continue
-            
-            # Get point data from row
+
+            # Get data from row
             frame_item = self.item(row, 0)
             if not frame_item:
                 continue
-            
+
             frame = int(frame_item.text())
             affected_frames.add(frame) # This frame will be regenerated
-            
+
+            # Check if this is a box row
+            is_box = frame_item.data(Qt.UserRole + 1) == "box"
+
             # Get object ID from the colored widget
             object_id = 0
             widget = self.cellWidget(row, 1)
@@ -416,23 +463,31 @@ class PointTable(QTableWidget):
                         break
                     except ValueError:
                         continue
-            
-            # Get coordinates
-            x_item = self.item(row, 3)
-            y_item = self.item(row, 4)
-            if not x_item or not y_item:
-                continue
-            
-            x, y = int(x_item.text()), int(y_item.text())
-            
-            # Remove point from manager
-            if hasattr(self, 'parent_window') and hasattr(self.parent_window, 'point_manager'):
-                removed_point = self.parent_window.point_manager.remove_point(frame, object_id, x, y)
-                if removed_point:
-                    removed_points.append(removed_point)
-                    print(f"Deleted point: Frame {frame}, Object {object_id}, Position ({x}, {y})")
-                elif len(rows) == 1:  # Single deletion - print warning
-                    print(f"Warning: Point not found in manager: Frame {frame}, Object {object_id}, Position ({x}, {y})")
+
+            if is_box:
+                # Remove box from manager
+                if hasattr(self, 'parent_window') and hasattr(self.parent_window, 'point_manager'):
+                    removed_box = self.parent_window.point_manager.remove_box(frame, object_id)
+                    if removed_box:
+                        removed_points.append(removed_box)
+                        print(f"Deleted box: Frame {frame}, Object {object_id}")
+            else:
+                # Get coordinates
+                x_item = self.item(row, 3)
+                y_item = self.item(row, 4)
+                if not x_item or not y_item:
+                    continue
+
+                x, y = int(x_item.text()), int(y_item.text())
+
+                # Remove point from manager
+                if hasattr(self, 'parent_window') and hasattr(self.parent_window, 'point_manager'):
+                    removed_point = self.parent_window.point_manager.remove_point(frame, object_id, x, y)
+                    if removed_point:
+                        removed_points.append(removed_point)
+                        print(f"Deleted point: Frame {frame}, Object {object_id}, Position ({x}, {y})")
+                    elif len(rows) == 1:  # Single deletion - print warning
+                        print(f"Warning: Point not found in manager: Frame {frame}, Object {object_id}, Position ({x}, {y})")
         
         # Remove all rows from table
         for row in rows:
@@ -451,12 +506,13 @@ class PointTable(QTableWidget):
                 if os.path.exists(frame_mask_dir):
                     shutil.rmtree(frame_mask_dir)
 
-            # Replay points to regenerate masks for affected frames 
+            # Replay points+boxes to regenerate masks for affected frames
             points = self.parent_window.point_manager.get_all_points()
+            boxes = self.parent_window.point_manager.boxes
             self.parent_window.sam_manager.propagated = False
             self.parent_window.matany_manager.propagated = False
             self.parent_window.update_tracking_status()
-            self.parent_window.sam_manager.replay_points(points)
+            self.parent_window.sam_manager.replay_points(points, boxes)
 
     def _update_delete_buttons(self):
         """Update all delete button connections after a row is removed"""
@@ -538,12 +594,14 @@ class PointTable(QTableWidget):
 
 class ImageViewer(QGraphicsView):
     """Custom graphics view for image display with zoom and pan functionality"""
-    
+
     # Add signal for point clicks
     point_clicked = Signal(int, int, bool)  # x, y coordinates, is_positive
     # Add signal for live preview
     preview_requested = Signal(int, int, bool)  # x, y, is_positive
     preview_cancelled = Signal()
+    # Add signal for box drawing
+    box_drawn = Signal(int, int, int, int)  # x1, y1, x2, y2 scene coords
     # Add signal for file drops
     file_dropped = Signal(str)  # file path
     
@@ -595,6 +653,30 @@ class ImageViewer(QGraphicsView):
         self._preview_last_pos = None
         self._preview_running = False  # throttle flag
 
+        # Box tool state
+        self._box_mode = False
+        self._box_activated_by_key = False  # True if B keypress activated box mode
+        self._box_dragging = False
+        self._box_start = None  # QPointF scene coords
+        self._box_rubber_band = None  # QGraphicsRectItem
+
+
+    def set_box_mode(self, enabled):
+        """Toggle box drawing mode"""
+        self._box_mode = enabled
+        if enabled:
+            self.setCursor(Qt.CrossCursor)
+        else:
+            self.setCursor(Qt.ArrowCursor)
+            self._cancel_box_drag()
+
+    def _cancel_box_drag(self):
+        """Cancel an in-progress box drag and remove rubber band"""
+        self._box_dragging = False
+        self._box_start = None
+        if self._box_rubber_band is not None:
+            self.scene.removeItem(self._box_rubber_band)
+            self._box_rubber_band = None
 
     def load_image(self, image, preserve_zoom=True):
         """Load and display an image from file path"""
@@ -760,14 +842,30 @@ class ImageViewer(QGraphicsView):
         self.set_zoom(new_scale)
     
     def mousePressEvent(self, event: QMouseEvent):
-        """Handle mouse press events for clicking and panning"""
+        """Handle mouse press events for clicking, panning, and box drawing"""
         if event.button() == Qt.MiddleButton:
             self._is_panning = True
             self._pan_start = event.position().toPoint()
             self.setCursor(Qt.ClosedHandCursor)
             super().mousePressEvent(event)
             return
-    
+
+        # Box mode: left-click starts box drag
+        if self._box_mode and self.point_editing_enabled and event.button() == Qt.LeftButton:
+            scene_pos = self.mapToScene(event.position().toPoint())
+            x, y = int(scene_pos.x()), int(scene_pos.y())
+            if (self.original_pixmap and
+                    0 <= x < self.original_pixmap.width() and
+                    0 <= y < self.original_pixmap.height()):
+                self._box_dragging = True
+                self._box_start = scene_pos
+                # Create rubber band rect
+                from PySide6.QtGui import QPen, QBrush
+                pen = QPen(QColor(255, 255, 0), 2, Qt.DashLine)
+                self._box_rubber_band = self.scene.addRect(
+                    scene_pos.x(), scene_pos.y(), 0, 0, pen)
+                return
+
         if self.point_editing_enabled:
             if event.button() == Qt.LeftButton:
                 # Update preview point type in case shift is held
@@ -809,17 +907,29 @@ class ImageViewer(QGraphicsView):
         super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event: QMouseEvent):
-        """Handle mouse movement for panning, coordinate display, and live preview"""
+        """Handle mouse movement for panning, coordinate display, live preview, and box dragging"""
         if self._is_panning:
             delta = event.position().toPoint() - self._pan_start
             self._pan_start = event.position().toPoint()
-            
+
             self.horizontalScrollBar().setValue(
                 self.horizontalScrollBar().value() - delta.x()
             )
             self.verticalScrollBar().setValue(
                 self.verticalScrollBar().value() - delta.y()
             )
+        elif self._box_dragging and self._box_start is not None:
+            # Update rubber band rect during box drag
+            scene_pos = self.mapToScene(event.position().toPoint())
+            # Clamp to image bounds
+            if self.original_pixmap:
+                w, h = self.original_pixmap.width(), self.original_pixmap.height()
+                scene_pos.setX(max(0, min(w - 1, scene_pos.x())))
+                scene_pos.setY(max(0, min(h - 1, scene_pos.y())))
+            from PySide6.QtCore import QRectF
+            rect = QRectF(self._box_start, scene_pos).normalized()
+            if self._box_rubber_band is not None:
+                self._box_rubber_band.setRect(rect)
         else:
             self._update_mouse_status(event.position().toPoint())
 
@@ -850,14 +960,39 @@ class ImageViewer(QGraphicsView):
         if event.button() == Qt.MiddleButton:
             self._is_panning = False
             self.setCursor(Qt.ArrowCursor)
-        
+        elif event.button() == Qt.LeftButton and self._box_dragging:
+            # Finalize box drag
+            scene_pos = self.mapToScene(event.position().toPoint())
+            if self.original_pixmap:
+                w, h = self.original_pixmap.width(), self.original_pixmap.height()
+                scene_pos.setX(max(0, min(w - 1, scene_pos.x())))
+                scene_pos.setY(max(0, min(h - 1, scene_pos.y())))
+            x1 = int(min(self._box_start.x(), scene_pos.x()))
+            y1 = int(min(self._box_start.y(), scene_pos.y()))
+            x2 = int(max(self._box_start.x(), scene_pos.x()))
+            y2 = int(max(self._box_start.y(), scene_pos.y()))
+            # Remove rubber band
+            if self._box_rubber_band is not None:
+                self.scene.removeItem(self._box_rubber_band)
+                self._box_rubber_band = None
+            self._box_dragging = False
+            self._box_start = None
+            # Ignore boxes < 5x5 px
+            if (x2 - x1) >= 5 and (y2 - y1) >= 5:
+                self.box_drawn.emit(x1, y1, x2, y2)
+            return
+
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
-        """Activate or update live preview on Shift/Ctrl press"""
+        """Activate or update live preview on Shift/Ctrl press; hold-B for box mode"""
         if event.isAutoRepeat():
             super().keyPressEvent(event)
             return
+
+        if event.key() == Qt.Key_B and not self._box_mode:
+            self._box_activated_by_key = True
+            self.set_box_mode(True)
 
         if event.key() == Qt.Key_Shift:
             self._preview_active = True
@@ -883,10 +1018,14 @@ class ImageViewer(QGraphicsView):
         super().keyPressEvent(event)
 
     def keyReleaseEvent(self, event):
-        """Deactivate or update live preview on Shift/Ctrl release"""
+        """Deactivate or update live preview on Shift/Ctrl release; release B exits box mode"""
         if event.isAutoRepeat():
             super().keyReleaseEvent(event)
             return
+
+        if event.key() == Qt.Key_B and self._box_activated_by_key:
+            self._box_activated_by_key = False
+            self.set_box_mode(False)
 
         if event.key() == Qt.Key_Shift:
             self._preview_active = False

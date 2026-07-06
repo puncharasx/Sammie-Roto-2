@@ -155,7 +155,13 @@ class SegmentationTab(QWidget):
 
         instructions_label.setAlignment(Qt.AlignCenter)
         add_point_layout.addWidget(instructions_label)
-        
+
+        # Box mode toggle button
+        self.box_mode_btn = QPushButton("Box Mode (Hold B)")
+        self.box_mode_btn.setCheckable(True)
+        self.box_mode_btn.setToolTip("Toggle box drawing mode. Drag a rectangle to select an object.\nHold B key or click this button to activate.")
+        add_point_layout.addWidget(self.box_mode_btn)
+
         layout.addWidget(add_point_group)
     
     def _create_model_selection_group(self, layout):
@@ -1258,6 +1264,7 @@ class MainWindow(QMainWindow):
         self.viewer.point_clicked.connect(self.add_point_from_click)
         self.viewer.preview_requested.connect(self.on_preview_requested)
         self.viewer.preview_cancelled.connect(self.on_preview_cancelled)
+        self.viewer.box_drawn.connect(self.add_box_from_drag)
 
         # Connect image viewer file drops to file loading
         self.viewer.file_dropped.connect(self.handle_dropped_file)
@@ -1282,6 +1289,7 @@ class MainWindow(QMainWindow):
             seg_tab.track_one_frame_forward_btn.clicked.connect(self.track_one_frame_forward)
             seg_tab.track_forward_btn.clicked.connect(self.track_forward)
             seg_tab.deduplicate_masks_btn.clicked.connect(self.deduplicate_similar_masks)
+            seg_tab.box_mode_btn.clicked.connect(self._toggle_box_mode)
 
             # Connect postprocessing tab sliders
 
@@ -1873,6 +1881,13 @@ class MainWindow(QMainWindow):
         # Update the display
         self._update_current_frame_display()
 
+    def _mark_tracking_stale(self):
+        """Mark all tracking/matting/removal state as stale after edits"""
+        self.sam_manager.propagated = False
+        self.sam_manager.deduplicated = False
+        self.matany_manager.propagated = False
+        self.removal_manager.propagated = False
+
     def _on_points_changed(self, action, **kwargs):
         """Update GUI when point data changes"""
         if action == 'add':
@@ -1880,36 +1895,38 @@ class MainWindow(QMainWindow):
             # Ensure current_frame is up to date before adding point
             self.point_table.set_current_frame(self.frame_slider.value())
             self.point_table.add_point(point['frame'], point['object_id'], point['positive'], point['x'], point['y'])
-            # Mark tracking as stale (remove checkmarks) but don't clear data
-            self.sam_manager.propagated = False
-            self.sam_manager.deduplicated = False
-            self.matany_manager.propagated = False
-            self.removal_manager.propagated = False
+            self._mark_tracking_stale()
             # No image update here - wait for segmentation to complete
             
+        elif action == 'add_box':
+            box = kwargs['box']
+            self.point_table.set_current_frame(self.frame_slider.value())
+            self.point_table.add_box(box['frame'], box['object_id'], box['x1'], box['y1'], box['x2'], box['y2'])
+            self._mark_tracking_stale()
+
+        elif action == 'remove_box':
+            box = kwargs.get('box')
+            if box:
+                self._refresh_table()
+                # Replay all points+boxes after box removal
+                self.sam_manager.replay_points(self.point_manager.get_all_points(), self.point_manager.boxes)
+                self._mark_tracking_stale()
+
         elif action == 'remove_last':
             point = kwargs.get('point')
             if point:
                 self.point_table.remove_last_point()
                 points = self.point_manager.get_all_points()
                 # Don't clear tracking - just replay points
-                self.sam_manager.replay_points(points)
-                # Mark tracking as stale (remove checkmarks) but don't clear data
-                self.sam_manager.propagated = False
-                self.sam_manager.deduplicated = False
-                self.matany_manager.propagated = False
-                self.removal_manager.propagated = False
+                self.sam_manager.replay_points(points, self.point_manager.boxes)
+                self._mark_tracking_stale()
                 # No image update here - wait for segmentation to complete
-        
+
         elif action == 'clear_frame':
             points = self.point_manager.get_all_points()
             # Don't clear tracking - just replay points
-            self.sam_manager.replay_points(points)
-            # Mark tracking as stale (remove checkmarks) but don't clear data
-            self.sam_manager.propagated = False
-            self.sam_manager.deduplicated = False
-            self.matany_manager.propagated = False
-            self.removal_manager.propagated = False
+            self.sam_manager.replay_points(points, self.point_manager.boxes)
+            self._mark_tracking_stale()
             # No image update here - wait for segmentation to complete
             self._refresh_table()
             
@@ -1999,7 +2016,10 @@ class MainWindow(QMainWindow):
         current_frame = self.frame_slider.value()
         view_options = self.get_view_options()
         object_id = self.sidebar.segmentation_tab.get_selected_object_id() if preview_mask is not None else None
-        updated_image = sammie.update_image(current_frame, view_options, self.point_manager.points, object_id_filter=object_id, preview_mask=preview_mask)
+        updated_image = sammie.update_image(
+            current_frame, view_options, self.point_manager.points,
+            object_id_filter=object_id, preview_mask=preview_mask,
+            boxes=self.point_manager.boxes)
         if updated_image:
             self.viewer.update_image(updated_image)
             
@@ -2008,10 +2028,10 @@ class MainWindow(QMainWindow):
         settings_mgr = self.settings_mgr
         show_all_points = settings_mgr.get_session_setting("show_all_points", True)
         current_frame = self.frame_slider.value()
-        
+
         # Update current_frame in point table
         self.point_table.set_current_frame(current_frame)
-        
+
         self.point_table.clear_points()
         for point in self.point_manager.points:
             # If show_all_points is disabled, only add points for current frame
@@ -2020,11 +2040,19 @@ class MainWindow(QMainWindow):
             elif show_all_points:
                 self.point_table.add_point(point['frame'], point['object_id'], point['positive'], point['x'], point['y'])
 
+        # Also add boxes
+        for box in self.point_manager.boxes:
+            if not show_all_points and box['frame'] == current_frame:
+                self.point_table.add_box(box['frame'], box['object_id'], box['x1'], box['y1'], box['x2'], box['y2'])
+            elif show_all_points:
+                self.point_table.add_box(box['frame'], box['object_id'], box['x1'], box['y1'], box['x2'], box['y2'])
+
     def closeEvent(self, event):
         """Clean up on close"""
         # Save current session state
         self._save_current_ui_state()
         self.settings_mgr.save_points(self.point_manager.get_all_points())
+        self.settings_mgr.save_boxes(self.point_manager.get_all_boxes())
         self.settings_mgr.save_session_settings()
         
         self._save_window_and_splitter_settings()
@@ -2040,12 +2068,12 @@ class MainWindow(QMainWindow):
         """Add point when user clicks image"""
         current_frame = self.frame_slider.value()
         seg_tab = self.sidebar.segmentation_tab
-        
+
         object_id = seg_tab.get_selected_object_id()
-        
+
         # Determine point type from the click
         point_type = "positive" if is_positive else "negative"
-        
+
         # Add point to table
         self._add_point_and_segment(current_frame, object_id, is_positive, x, y, point_type)
 
@@ -2053,6 +2081,26 @@ class MainWindow(QMainWindow):
         if self.viewer._preview_active:
             self.viewer._preview_pending_pos = (x, y)
             self.viewer._preview_timer.start()
+
+    def add_box_from_drag(self, x1, y1, x2, y2):
+        """Add box when user drags in box mode"""
+        current_frame = self.frame_slider.value()
+        seg_tab = self.sidebar.segmentation_tab
+        object_id = seg_tab.get_selected_object_id()
+
+        # Store the box (replaces any existing box for this frame/object)
+        self.point_manager.add_box(current_frame, object_id, x1, y1, x2, y2)
+        print(f"Added box: Frame {current_frame}, Object {object_id}, "
+              f"({x1},{y1})-({x2},{y2})")
+
+        # Segment with box + existing points
+        box = self.point_manager.get_sam2_box(current_frame, object_id)
+        coordinates, labels = self.point_manager.get_sam2_points(current_frame, object_id)
+        self.sam_manager.segment_image(current_frame, object_id, coordinates, labels, box=box)
+
+    def _toggle_box_mode(self, checked):
+        """Toggle box drawing mode from toolbar button"""
+        self.viewer.set_box_mode(checked)
 
     def _add_point_and_segment(self, frame, object_id, is_positive, x, y, point_type):
         """Helper method to add point and trigger segmentation"""
@@ -2063,14 +2111,17 @@ class MainWindow(QMainWindow):
         
         # Get points for segmentation
         coordinates, labels = self.point_manager.get_sam2_points(frame, object_id)
-        
+        box = self.point_manager.get_sam2_box(frame, object_id)
+
         # Run segmentation (this will trigger segmentation callback and update image)
-        self.sam_manager.segment_image(frame, object_id, coordinates, labels)  
-    
+        self.sam_manager.segment_image(frame, object_id, coordinates, labels, box=box)
+
     def on_preview_requested(self, x, y, is_positive):
         frame = self.frame_slider.value()
         object_id = self.sidebar.segmentation_tab.get_selected_object_id()
-        preview_mask = self.sam_manager.preview_point(frame, object_id, self.point_manager.get_all_points(), x, y, is_positive)
+        preview_mask = self.sam_manager.preview_point(
+            frame, object_id, self.point_manager.get_all_points(), x, y, is_positive,
+            boxes_list=self.point_manager.boxes)
         if preview_mask is not None:
             self._update_current_frame_display(preview_mask=preview_mask)
 
@@ -2085,13 +2136,13 @@ class MainWindow(QMainWindow):
             self.point_table.delete_selected_row(single_row=row)
 
     def replay_all_points(self):
-        """Replay all points to rebuild masks"""
-        if not self.point_manager.points:
-            print("No points to replay")
+        """Replay all points and boxes to rebuild masks"""
+        if not self.point_manager.points and not self.point_manager.boxes:
+            print("No points or boxes to replay")
             return
-        
-        print(f"Replaying {len(self.point_manager.points)} points...")
-        self.sam_manager.replay_points(self.point_manager.get_all_points())
+
+        print(f"Replaying {len(self.point_manager.points)} points, {len(self.point_manager.boxes)} boxes...")
+        self.sam_manager.replay_points(self.point_manager.get_all_points(), self.point_manager.boxes)
         
         # Update display after replay
         self._update_current_frame_display()
@@ -2846,6 +2897,12 @@ class MainWindow(QMainWindow):
                 points = self.settings_mgr.load_points()
                 if points:
                     self.point_manager.points = points
+
+                boxes = self.settings_mgr.load_boxes()
+                if boxes:
+                    self.point_manager.boxes = boxes
+
+                if points or boxes:
                     self.point_manager._notify('load_all')
                 
                 # Load UI state from session

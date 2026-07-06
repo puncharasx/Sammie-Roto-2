@@ -25,6 +25,16 @@ from sammie.model_downloader import ensure_models
 smoothing_model = None  # global variable needed to avoid complexity of passing the model around
 
 
+def _find_box_for_object(boxes_list, frame, object_id):
+    """Find box dict for (frame, object_id) and return as np.array, or None."""
+    if not boxes_list:
+        return None
+    for b in boxes_list:
+        if b['frame'] == frame and b['object_id'] == object_id:
+            return np.array([b['x1'], b['y1'], b['x2'], b['y2']], dtype=np.float32)
+    return None
+
+
 # .........................................................................................
 # SAM2 / EfficientTAM segmentation
 # .........................................................................................
@@ -111,17 +121,19 @@ class SamManager:
             video_path=core.frames_dir, async_loading_frames=True, offload_video_to_cpu=True
         )
 
-    def segment_image(self, frame_number, object_id, input_points, input_labels):
+    def segment_image(self, frame_number, object_id, input_points, input_labels, box=None):
         extension = core.get_frame_extension()
         frame_filename = os.path.join(core.frames_dir, f"{frame_number:05d}.{extension}")
         if os.path.exists(frame_filename):
-            #self.predictor.reset_state(self.inference_state)
+            # When box is provided, clear_old_points=True is required by SAM2
             _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
                 inference_state=self.inference_state,
                 frame_idx=frame_number,
                 obj_id=object_id,
                 points=input_points,
                 labels=input_labels,
+                box=box,
+                clear_old_points=box is not None,
             )
             # Save the segmentation masks
             for i, out_obj_id in enumerate(out_obj_ids):
@@ -134,7 +146,7 @@ class SamManager:
             # Notify that segmentation is complete
             self._notify('segmentation_complete', frame=frame_number, object_id=object_id, out_obj_ids=out_obj_ids)
 
-    def preview_point(self, frame_number, object_id, all_points, preview_x, preview_y, is_positive):
+    def preview_point(self, frame_number, object_id, all_points, preview_x, preview_y, is_positive, boxes_list=None):
         """Run a preview using the real video predictor, then revert the state."""
         if self.predictor is None or self.inference_state is None:
             return None
@@ -142,17 +154,21 @@ class SamManager:
             existing = [p for p in all_points
                         if p['frame'] == frame_number and p['object_id'] == object_id]
 
+            # Check if there's a box for this frame/object
+            box = _find_box_for_object(boxes_list, frame_number, object_id)
+
             # Build preview point set
             preview_points = np.array([[p['x'], p['y']] for p in existing] + [[preview_x, preview_y]], dtype=np.float32)
             preview_labels = np.array([1 if p['positive'] else 0 for p in existing] + [1 if is_positive else 0], dtype=np.int32)
 
-            # Step 1: run with preview point
+            # Step 1: run with preview point (+ box if present)
             _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
                 inference_state=self.inference_state,
                 frame_idx=frame_number,
                 obj_id=object_id,
                 points=preview_points,
                 labels=preview_labels,
+                box=box,
                 clear_old_points=True,
             )
 
@@ -164,16 +180,17 @@ class SamManager:
                     preview_mask = (mask * 255).astype(np.uint8)
                     break
 
-            # Step 2: revert by replaying the original points
-            if existing:
-                orig_points = np.array([[p['x'], p['y']] for p in existing], dtype=np.float32)
-                orig_labels = np.array([1 if p['positive'] else 0 for p in existing], dtype=np.int32)
+            # Step 2: revert by replaying the original points (+ box if present)
+            if existing or box is not None:
+                orig_points = np.array([[p['x'], p['y']] for p in existing], dtype=np.float32) if existing else np.empty((0, 2), dtype=np.float32)
+                orig_labels = np.array([1 if p['positive'] else 0 for p in existing], dtype=np.int32) if existing else np.empty(0, dtype=np.int32)
                 self.predictor.add_new_points_or_box(
                     inference_state=self.inference_state,
                     frame_idx=frame_number,
                     obj_id=object_id,
                     points=orig_points,
                     labels=orig_labels,
+                    box=box,
                     clear_old_points=True,
                 )
             else:
@@ -185,26 +202,37 @@ class SamManager:
             print(f"Preview error: {e}")
             return None
 
-    def replay_points(self, points_list):
-        """Replay all points incrementally to rebuild masks."""
+    def replay_points(self, points_list, boxes_list=None):
+        """Replay all points (and boxes) incrementally to rebuild masks."""
         frame_count = core.VideoInfo.total_frames
         self.predictor.reset_state(self.inference_state)
+        if boxes_list is None:
+            boxes_list = []
 
         for frame_number in range(frame_count):
             frame_points = [p for p in points_list if p['frame'] == frame_number]
-            if not frame_points:
+            frame_boxes = [b for b in boxes_list if b['frame'] == frame_number]
+            if not frame_points and not frame_boxes:
                 continue
 
             frame_object_ids = {p['object_id'] for p in frame_points}
+            # Also include objects that have boxes but no points
+            for b in frame_boxes:
+                frame_object_ids.add(b['object_id'])
+
             for object_id in frame_object_ids:
+                # Check if this object has a box on this frame
+                obj_box = _find_box_for_object(frame_boxes, frame_number, object_id)
+
                 filtered_points = [
                     (p['x'], p['y'], p['positive'])
                     for p in frame_points if p['object_id'] == object_id
                 ]
-                for i in range(1, len(filtered_points) + 1):
-                    subset = filtered_points[:i]
-                    input_points = np.array([(x, y) for x, y, _ in subset], dtype=np.float32)
-                    input_labels = np.array([1 if pos else 0 for _, _, pos in subset], dtype=np.int32)
+
+                if obj_box is not None:
+                    # Box present: single combined call with box + all points
+                    input_points = np.array([(x, y) for x, y, _ in filtered_points], dtype=np.float32) if filtered_points else np.empty((0, 2), dtype=np.float32)
+                    input_labels = np.array([1 if pos else 0 for _, _, pos in filtered_points], dtype=np.int32) if filtered_points else np.empty(0, dtype=np.int32)
                     try:
                         _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
                             inference_state=self.inference_state,
@@ -212,11 +240,30 @@ class SamManager:
                             obj_id=object_id,
                             points=input_points,
                             labels=input_labels,
+                            box=obj_box,
                             clear_old_points=True
                         )
                     except Exception as e:
-                        print(f"Error during prediction for frame {frame_number}, object {object_id}, point {i}: {e}")
+                        print(f"Error during prediction for frame {frame_number}, object {object_id} (box): {e}")
                         continue
+                else:
+                    # No box: incremental replay (original behavior)
+                    for i in range(1, len(filtered_points) + 1):
+                        subset = filtered_points[:i]
+                        input_points = np.array([(x, y) for x, y, _ in subset], dtype=np.float32)
+                        input_labels = np.array([1 if pos else 0 for _, _, pos in subset], dtype=np.int32)
+                        try:
+                            _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
+                                inference_state=self.inference_state,
+                                frame_idx=frame_number,
+                                obj_id=object_id,
+                                points=input_points,
+                                labels=input_labels,
+                                clear_old_points=True
+                            )
+                        except Exception as e:
+                            print(f"Error during prediction for frame {frame_number}, object {object_id}, point {i}: {e}")
+                            continue
 
                 # Save masks only after the final point for this object
                 for j, out_obj_id in enumerate(out_obj_ids):
@@ -418,7 +465,7 @@ def load_smoothing_model():
 # View / display handlers
 # .........................................................................................
 
-def update_image(slider_value, view_options, points, return_numpy=False, object_id_filter=None, preview_mask=None):
+def update_image(slider_value, view_options, points, return_numpy=False, object_id_filter=None, preview_mask=None, boxes=None):
     """Main image update function - delegates to specific view handlers
 
     Args:
@@ -427,6 +474,7 @@ def update_image(slider_value, view_options, points, return_numpy=False, object_
         points: List of point dictionaries
         return_numpy: If True, return numpy array; if False, return QPixmap
         object_id_filter: If specified, only process masks for this object ID
+        boxes: List of box dictionaries (optional)
 
     Returns:
         QPixmap or numpy array depending on return_numpy parameter
@@ -434,7 +482,7 @@ def update_image(slider_value, view_options, points, return_numpy=False, object_
     view_mode = view_options.get("view_mode", "Segmentation-Edit")
 
     if view_mode == "Segmentation-Edit":
-        return _handle_segmentation_edit_view(slider_value, view_options, points, return_numpy, object_id_filter, preview_mask)
+        return _handle_segmentation_edit_view(slider_value, view_options, points, return_numpy, object_id_filter, preview_mask, boxes=boxes)
     elif view_mode == "Segmentation-Matte":
         return _handle_segmentation_matte_view(slider_value, view_options, points, return_numpy, object_id_filter)
     elif view_mode == "Segmentation-BGcolor":
@@ -500,7 +548,7 @@ def _handle_none_view(frame_number, return_numpy=False):
         return _convert_to_qpixmap(image)
 
 
-def _handle_segmentation_edit_view(frame_number, view_options, points, return_numpy=False, object_id_filter=None, preview_mask=None):
+def _handle_segmentation_edit_view(frame_number, view_options, points, return_numpy=False, object_id_filter=None, preview_mask=None, boxes=None):
     """Handle Segmentation-Edit view"""
     image = core.load_base_frame(frame_number)
     if image is None:
@@ -518,6 +566,8 @@ def _handle_segmentation_edit_view(frame_number, view_options, points, return_nu
         highlighted_points = [highlighted_points]
 
     image = draw_points(image, frame_number, points, highlighted_points)
+    if boxes:
+        image = draw_boxes(image, frame_number, boxes)
 
     if return_numpy:
         return image
@@ -760,6 +810,23 @@ def draw_points(image, frame_number, points, highlighted_points=None):
             cv2.circle(image, center, 9, (0, 128, 255), 3)
         cv2.circle(image, center, 5, (255, 255, 0), 2)
         cv2.circle(image, center, 4, point_color, -1)
+
+    return image
+
+def draw_boxes(image, frame_number, boxes):
+    """Draw box prompts on image"""
+    frame_boxes = [b for b in boxes if b['frame'] == frame_number]
+    if not frame_boxes:
+        return image
+
+    for box in frame_boxes:
+        obj_id = box['object_id']
+        color = core.PALETTE[obj_id % len(core.PALETTE)]
+        # Convert RGB to BGR for cv2
+        color_bgr = (color[2], color[1], color[0])
+        pt1 = (box['x1'], box['y1'])
+        pt2 = (box['x2'], box['y2'])
+        cv2.rectangle(image, pt1, pt2, color_bgr, 2)
 
     return image
 
