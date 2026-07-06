@@ -19,9 +19,10 @@ import requests
 from packaging import version
 from datetime import datetime
 from PySide6.QtWidgets import (
-    QLabel, QTableWidget, QTableWidgetItem, QAbstractItemView, 
+    QLabel, QTableWidget, QTableWidgetItem, QAbstractItemView,
     QHeaderView, QPushButton, QWidget, QHBoxLayout, QVBoxLayout,
     QDialog, QGraphicsView, QGraphicsScene, QGraphicsPixmapItem,
+    QGraphicsEllipseItem, QGraphicsItem,
     QColorDialog, QSlider, QStyleOptionSlider, QStyle, QMessageBox,
     QApplication, QLineEdit
 )
@@ -590,6 +591,88 @@ class PointTable(QTableWidget):
         }
 
 
+# ==================== DRAGGABLE POINT ITEM ====================
+
+class DraggablePointItem(QGraphicsEllipseItem):
+    """Interactive point marker that can be dragged to reposition.
+
+    Args:
+        point_data: dict with keys 'frame', 'object_id', 'positive', 'x', 'y'
+        image_size: (width, height) of the image for bounds clamping
+        parent: parent QGraphicsItem
+    """
+
+    RADIUS = 6  # px, scale-invariant via ItemIgnoresTransformations
+
+    def __init__(self, point_data, image_size, parent=None):
+        x, y = point_data['x'], point_data['y']
+        r = self.RADIUS
+        super().__init__(x - r, y - r, r * 2, r * 2, parent)
+
+        self.point_data = dict(point_data)
+        self._image_width, self._image_height = image_size
+        self._release_callback = None  # set by ImageViewer
+
+        # Visual style
+        color = QColor(0, 255, 0) if point_data['positive'] else QColor(255, 0, 0)
+        self.setBrush(color)
+        self.setPen(QPen(QColor(255, 255, 255), 1.5))
+
+        # Interaction flags
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setZValue(1000)  # above everything
+
+        self._highlighted = False
+
+    @staticmethod
+    def clamp_to_bounds(x, y, width, height):
+        """Clamp coordinates to image bounds [0, width-1] x [0, height-1]."""
+        return max(0, min(width - 1, x)), max(0, min(height - 1, y))
+
+    def set_highlighted(self, highlighted):
+        """Toggle highlight state (orange ring from table selection)."""
+        self._highlighted = highlighted
+        self.update()
+
+    def paint(self, painter, option, widget=None):
+        """Custom paint: draw highlight ring if needed, then default."""
+        if self._highlighted:
+            painter.setPen(QPen(QColor(0, 128, 255), 2.5))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(self.rect())
+        super().paint(painter, option, widget)
+
+    def itemChange(self, change, value):
+        """Clamp position to image bounds during drag."""
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange:
+            new_pos = value
+            x, y = self.clamp_to_bounds(
+                new_pos.x() + self.RADIUS,
+                new_pos.y() + self.RADIUS,
+                self._image_width,
+                self._image_height,
+            )
+            from PySide6.QtCore import QPointF
+            return QPointF(x - self.RADIUS, y - self.RADIUS)
+        return super().itemChange(change, value)
+
+    def mouseReleaseEvent(self, event):
+        """On release, commit new position via callback."""
+        super().mouseReleaseEvent(event)
+        # Center of the ellipse in scene coords
+        center = self.pos() + QPointF(self.RADIUS, self.RADIUS)
+        new_x, new_y = self.clamp_to_bounds(
+            int(center.x()), int(center.y()),
+            self._image_width, self._image_height,
+        )
+        if self._release_callback:
+            self._release_callback(self.point_data, new_x, new_y)
+
+
 # ==================== IMAGE VIEWER ====================
 
 class ImageViewer(QGraphicsView):
@@ -602,6 +685,8 @@ class ImageViewer(QGraphicsView):
     preview_cancelled = Signal()
     # Add signal for box drawing
     box_drawn = Signal(int, int, int, int)  # x1, y1, x2, y2 scene coords
+    # Add signal for point drag release
+    point_moved = Signal(dict, int, int)  # point_data, new_x, new_y
     # Add signal for file drops
     file_dropped = Signal(str)  # file path
     
@@ -660,6 +745,10 @@ class ImageViewer(QGraphicsView):
         self._box_start = None  # QPointF scene coords
         self._box_rubber_band = None  # QGraphicsRectItem
 
+        # Draggable point state
+        self._draggable_points = []  # List[DraggablePointItem]
+        self._dragging_point = None  # Currently dragged item
+
 
     def set_box_mode(self, enabled):
         """Toggle box drawing mode"""
@@ -677,6 +766,47 @@ class ImageViewer(QGraphicsView):
         if self._box_rubber_band is not None:
             self.scene.removeItem(self._box_rubber_band)
             self._box_rubber_band = None
+
+    # ---- Draggable point management ----
+
+    def set_draggable_points(self, points, frame_number, image_size):
+        """Create DraggablePointItem for each point on frame_number.
+
+        Args:
+            points: list of point dicts
+            frame_number: only points on this frame are shown
+            image_size: (width, height) for bounds clamping
+        """
+        self.clear_draggable_points()
+        for p in points:
+            if p['frame'] != frame_number:
+                continue
+            item = DraggablePointItem(p, image_size)
+            item._release_callback = self._on_draggable_point_released
+            self.scene.addItem(item)
+            self._draggable_points.append(item)
+
+    def clear_draggable_points(self):
+        """Remove all draggable point items from the scene."""
+        for item in self._draggable_points:
+            self.scene.removeItem(item)
+        self._draggable_points.clear()
+        self._dragging_point = None
+
+    def set_highlighted_point(self, point_data):
+        """Highlight the draggable point matching point_data (or clear all)."""
+        for item in self._draggable_points:
+            match = (point_data is not None and
+                     item.point_data['frame'] == point_data['frame'] and
+                     item.point_data['object_id'] == point_data['object_id'] and
+                     item.point_data['x'] == point_data['x'] and
+                     item.point_data['y'] == point_data['y'])
+            item.set_highlighted(match)
+
+    def _on_draggable_point_released(self, point_data, new_x, new_y):
+        """Called by DraggablePointItem on mouse release."""
+        self._dragging_point = None
+        self.point_moved.emit(point_data, new_x, new_y)
 
     def load_image(self, image, preserve_zoom=True):
         """Load and display an image from file path"""
@@ -866,6 +996,17 @@ class ImageViewer(QGraphicsView):
                     scene_pos.x(), scene_pos.y(), 0, 0, pen)
                 return
 
+        # Draggable point hit: if clicking on a DraggablePointItem, let Qt handle the drag
+        if event.button() == Qt.LeftButton and self.point_editing_enabled:
+            item = self.itemAt(event.position().toPoint())
+            if isinstance(item, DraggablePointItem):
+                self._dragging_point = item
+                # Suppress shift-preview while dragging
+                self._preview_active = False
+                self._preview_timer.stop()
+                super().mousePressEvent(event)
+                return
+
         if self.point_editing_enabled:
             if event.button() == Qt.LeftButton:
                 # Update preview point type in case shift is held
@@ -957,6 +1098,9 @@ class ImageViewer(QGraphicsView):
     
     def mouseReleaseEvent(self, event: QMouseEvent):
         """Handle mouse release events"""
+        # Clear dragging point state (the item's own mouseReleaseEvent handles commit)
+        if event.button() == Qt.LeftButton and self._dragging_point is not None:
+            self._dragging_point = None
         if event.button() == Qt.MiddleButton:
             self._is_panning = False
             self.setCursor(Qt.ArrowCursor)
