@@ -21,6 +21,7 @@ from sammie.duplicate_frame_handler import replace_similar_matte_frames
 from sammie.settings_manager import get_settings_manager
 from sammie.gui_widgets import show_message_dialog
 from sammie.model_downloader import ensure_models
+from sammie.workers import TrackingWorker
 
 smoothing_model = None  # global variable needed to avoid complexity of passing the model around
 
@@ -48,10 +49,25 @@ class SamManager:
         self.propagated = False  # whether we have propagated the masks
         self.deduplicated = False  # whether we have deduplicated the masks
         self.callbacks = []  # Add callbacks for segmentation events
+        self._worker = None  # Current TrackingWorker (if any)
+        self._busy = False  # True while a worker is running
+        self.frame_done_callbacks = []  # Callbacks for frame_done signal (slider nudge)
 
     def add_callback(self, callback):
         """Add callback for segmentation events"""
         self.callbacks.append(callback)
+
+    def add_frame_done_callback(self, callback):
+        """Add callback for frame_done events (e.g., slider nudge)."""
+        self.frame_done_callbacks.append(callback)
+
+    def _emit_frame_done(self, frame_idx):
+        """Emit frame_done to registered callbacks."""
+        for cb in self.frame_done_callbacks:
+            try:
+                cb(frame_idx)
+            except Exception as e:
+                print(f"frame_done callback error: {e}")
 
     def _notify(self, action, **kwargs):
         """Notify callbacks of changes"""
@@ -60,6 +76,48 @@ class SamManager:
                 callback(action, **kwargs)
             except Exception as e:
                 print(f"Callback error: {e}")
+
+    @property
+    def is_busy(self):
+        """True while a background worker is running."""
+        return self._busy
+
+    def cancel_tracking(self):
+        """Request cancellation of the current tracking worker."""
+        if self._worker is not None:
+            self._worker.request_cancel()
+
+    def _on_tracking_finished(self, result):
+        """Handle tracking worker completion."""
+        self._busy = False
+        cancelled = result.get('cancelled', False)
+        last_frame_idx = result.get('last_frame_idx')
+
+        if not cancelled:
+            # Determine if full propagation happened
+            settings_mgr = get_settings_manager()
+            frame_count = core.VideoInfo.total_frames
+            in_point = settings_mgr.get_session_setting("in_point", None)
+            out_point = settings_mgr.get_session_setting("out_point", None)
+            if in_point is None:
+                in_point = 0
+            if out_point is None:
+                out_point = frame_count - 1
+            total_frames = out_point - in_point + 1
+            self.propagated = (total_frames == frame_count)
+            print("Tracking completed")
+        else:
+            self.propagated = False
+            print("Tracking cancelled")
+
+        self._notify('tracking_complete', cancelled=cancelled, last_frame_idx=last_frame_idx)
+
+    def _on_tracking_error(self, error_msg):
+        """Handle tracking worker error."""
+        self._busy = False
+        self.propagated = False
+        print(f"Tracking error: {error_msg}")
+        self._notify('tracking_error', error=error_msg)
 
     def load_segmentation_model(self, model=None, parent_window=None):
         if model is None:
@@ -348,7 +406,15 @@ class SamManager:
         return last_frame_idx, cancelled
 
     def track_objects(self, parent_window):
-        """Track all objects across the full in/out point range (or the entire video)."""
+        """Track all objects across the full in/out point range (or the entire video).
+
+        Dispatches to a background TrackingWorker. Returns immediately.
+        Emits 'tracking_complete' or 'tracking_error' via callbacks when done.
+        """
+        if self._busy:
+            print("Tracking already in progress")
+            return 0
+
         frame_count = core.VideoInfo.total_frames
         settings_mgr = get_settings_manager()
         in_point = settings_mgr.get_session_setting("in_point", None)
@@ -356,56 +422,86 @@ class SamManager:
         if in_point is None:
             in_point = 0
         frames_to_track = None
-        total_frames = frame_count
         if out_point is not None:
             frames_to_track = out_point - in_point
-            total_frames = frames_to_track + 1
 
-        last_frame_idx, cancelled = self._propagate(
-            parent_window, start_frame_idx=in_point, max_frame_num_to_track=frames_to_track, reverse=False)
+        display_update_frequency = settings_mgr.get_app_setting("display_update_frequency", 5)
 
-        if not cancelled:
-            self.propagated = (total_frames == frame_count)
-            print("Tracking completed")
-            return 1
-        else:
-            self.propagated = False
-            print("Tracking cancelled")
-            return 0
+        self._busy = True
+        self._worker = TrackingWorker(
+            predictor=self.predictor,
+            inference_state=self.inference_state,
+            start_frame_idx=in_point,
+            max_frame_num_to_track=frames_to_track,
+            reverse=False,
+            display_update_frequency=display_update_frequency,
+            total_frames=frame_count,
+        )
+        self._worker.finished.connect(self._on_tracking_finished)
+        self._worker.error.connect(self._on_tracking_error)
+        self._worker.frame_done.connect(self._emit_frame_done)
+        self._worker.start()
+        return 1
 
     def track_forward(self, parent_window, current_frame):
-        """Track all objects forward from current_frame to the out point (or end of video)."""
+        """Track all objects forward from current_frame to the out point (or end of video).
+
+        Dispatches to a background TrackingWorker. Returns immediately.
+        """
+        if self._busy:
+            print("Tracking already in progress")
+            return 0
+
         settings_mgr = get_settings_manager()
         out_point = settings_mgr.get_session_setting("out_point", None)
         last_frame = out_point if out_point is not None else core.VideoInfo.total_frames - 1
         max_frame_num_to_track = max(last_frame - current_frame, 0)
+        display_update_frequency = settings_mgr.get_app_setting("display_update_frequency", 5)
 
-        last_frame_idx, cancelled = self._propagate(
-            parent_window, start_frame_idx=current_frame, max_frame_num_to_track=max_frame_num_to_track,
-            reverse=False)
-
-        if cancelled:
-            print("Forward tracking cancelled")
-            return 0
-        print(f"Forward tracking completed up to frame {last_frame_idx}")
+        self._busy = True
+        self._worker = TrackingWorker(
+            predictor=self.predictor,
+            inference_state=self.inference_state,
+            start_frame_idx=current_frame,
+            max_frame_num_to_track=max_frame_num_to_track,
+            reverse=False,
+            display_update_frequency=display_update_frequency,
+        )
+        self._worker.finished.connect(self._on_tracking_finished)
+        self._worker.error.connect(self._on_tracking_error)
+        self._worker.frame_done.connect(self._emit_frame_done)
+        self._worker.start()
         return 1
 
     def track_backward(self, parent_window, current_frame):
-        """Track all objects backward from current_frame to the in point (or start of video)."""
+        """Track all objects backward from current_frame to the in point (or start of video).
+
+        Dispatches to a background TrackingWorker. Returns immediately.
+        """
+        if self._busy:
+            print("Tracking already in progress")
+            return 0
+
         settings_mgr = get_settings_manager()
         in_point = settings_mgr.get_session_setting("in_point", None)
         if in_point is None:
             in_point = 0
         max_frame_num_to_track = max(current_frame - in_point, 0)
+        display_update_frequency = settings_mgr.get_app_setting("display_update_frequency", 5)
 
-        last_frame_idx, cancelled = self._propagate(
-            parent_window, start_frame_idx=current_frame, max_frame_num_to_track=max_frame_num_to_track,
-            reverse=True)
-
-        if cancelled:
-            print("Backward tracking cancelled")
-            return 0
-        print(f"Backward tracking completed back to frame {last_frame_idx}")
+        self._busy = True
+        self._worker = TrackingWorker(
+            predictor=self.predictor,
+            inference_state=self.inference_state,
+            start_frame_idx=current_frame,
+            max_frame_num_to_track=max_frame_num_to_track,
+            reverse=True,
+            display_update_frequency=display_update_frequency,
+        )
+        self._worker.finished.connect(self._on_tracking_finished)
+        self._worker.error.connect(self._on_tracking_error)
+        self._worker.frame_done.connect(self._emit_frame_done)
+        self._worker.start()
         return 1
 
     def track_one_frame_forward(self, parent_window, current_frame):
