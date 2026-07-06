@@ -104,6 +104,7 @@ class DeviceManager:
 class PointManager:
     def __init__(self):
         self.points = []  # List of dicts: {'frame': int, 'object_id': int, 'positive': bool, 'x': int, 'y': int}
+        self.boxes = []   # List of dicts: {'frame': int, 'object_id': int, 'x1': int, 'y1': int, 'x2': int, 'y2': int}
         self.callbacks = []  # Callbacks for when points change
 
     def add_callback(self, callback):
@@ -162,22 +163,28 @@ class PointManager:
         return None
 
     def clear_all(self):
-        """Clear all points"""
-        if self.points:  # Only notify if there were points to clear
+        """Clear all points and boxes"""
+        had_data = bool(self.points or self.boxes)
+        if had_data:
             self.points.clear()
+            self.boxes.clear()
             settings_mgr = get_settings_manager()
             settings_mgr.save_points(self.points)
+            settings_mgr.save_boxes(self.boxes)
             self._notify('clear_all')
 
     def clear_frame(self, frame):
-        """Clear points for a frame"""
+        """Clear points and boxes for a frame"""
         import shutil
         before_count = len(self.points)
         points_to_remove = [p for p in self.points if p['frame'] == frame]
         self.points = [p for p in self.points if p['frame'] != frame]
         removed_count = before_count - len(self.points)
 
-        if removed_count > 0:
+        # Also clear boxes for this frame
+        boxes_removed = self.clear_boxes_for_frame(frame)
+
+        if removed_count > 0 or boxes_removed > 0:
             # Remove mask files for this frame
             frame_mask_dir = os.path.join(mask_dir, f"{frame:05d}")
             if os.path.exists(frame_mask_dir):
@@ -188,13 +195,16 @@ class PointManager:
         return removed_count
 
     def clear_object(self, object_id):
-        """Clear points for an object"""
+        """Clear points and boxes for an object"""
         before_count = len(self.points)
         points_to_remove = [p for p in self.points if p['object_id'] == object_id]
         self.points = [p for p in self.points if p['object_id'] != object_id]
         removed_count = before_count - len(self.points)
 
-        if removed_count > 0:
+        # Also clear boxes for this object
+        boxes_removed = self.clear_boxes_for_object(object_id)
+
+        if removed_count > 0 or boxes_removed > 0:
             # Remove mask files for this object across all frames
             for point in points_to_remove:
                 mask_filename = os.path.join(mask_dir, f'{point["frame"]:05d}', f'{object_id}.png')
@@ -228,6 +238,69 @@ class PointManager:
     def get_all_points(self):
         """Get all points"""
         return self.points.copy()
+
+    # ---- Box methods ----
+
+    def add_box(self, frame, object_id, x1, y1, x2, y2):
+        """Add or replace a box for (frame, object_id). Max one box per pair."""
+        # Remove existing box for this frame/object if any
+        self.boxes = [b for b in self.boxes
+                      if not (b['frame'] == frame and b['object_id'] == object_id)]
+        box = {'frame': frame, 'object_id': object_id,
+               'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2}
+        self.boxes.append(box)
+        self._notify('add_box', box=box)
+        settings_mgr = get_settings_manager()
+        settings_mgr.save_boxes(self.boxes)
+        return box
+
+    def remove_box(self, frame, object_id):
+        """Remove box for (frame, object_id)"""
+        box_to_remove = None
+        for i, b in enumerate(self.boxes):
+            if b['frame'] == frame and b['object_id'] == object_id:
+                box_to_remove = self.boxes.pop(i)
+                break
+        if box_to_remove:
+            settings_mgr = get_settings_manager()
+            settings_mgr.save_boxes(self.boxes)
+            self._notify('remove_box', box=box_to_remove)
+        return box_to_remove
+
+    def get_sam2_box(self, frame, object_id):
+        """Get box in SAM2 format: np.array([x1,y1,x2,y2], dtype=float32) or None"""
+        for b in self.boxes:
+            if b['frame'] == frame and b['object_id'] == object_id:
+                return np.array([b['x1'], b['y1'], b['x2'], b['y2']], dtype=np.float32)
+        return None
+
+    def get_boxes_for_frame(self, frame):
+        """Get all boxes for a frame"""
+        return [b for b in self.boxes if b['frame'] == frame]
+
+    def clear_boxes_for_frame(self, frame):
+        """Remove all boxes on a frame"""
+        before = len(self.boxes)
+        self.boxes = [b for b in self.boxes if b['frame'] != frame]
+        removed = before - len(self.boxes)
+        if removed:
+            settings_mgr = get_settings_manager()
+            settings_mgr.save_boxes(self.boxes)
+        return removed
+
+    def clear_boxes_for_object(self, object_id):
+        """Remove all boxes for an object across all frames"""
+        before = len(self.boxes)
+        self.boxes = [b for b in self.boxes if b['object_id'] != object_id]
+        removed = before - len(self.boxes)
+        if removed:
+            settings_mgr = get_settings_manager()
+            settings_mgr.save_boxes(self.boxes)
+        return removed
+
+    def get_all_boxes(self):
+        """Get all boxes"""
+        return self.boxes.copy()
 
 
 # .........................................................................................

@@ -165,6 +165,7 @@ class SettingsManager:
         self.app_settings_file = "sammie_settings.conf"
         self.session_settings_file = os.path.join(temp_dir, "session_settings.conf")
         self.points_file = os.path.join(temp_dir, "points.json")
+        self.boxes_file = os.path.join(temp_dir, "boxes.json")
         
         # Initialize settings
         self.app_settings = ApplicationSettings()
@@ -321,6 +322,30 @@ class SettingsManager:
         except Exception as e:
             print(f"Error loading points: {e}")
         return None
+
+    def save_boxes(self, boxes_list: list) -> bool:
+        """Save boxes to session directory"""
+        try:
+            os.makedirs(self.temp_dir, exist_ok=True)
+            with open(self.boxes_file, 'w') as f:
+                json.dump(boxes_list, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Error saving boxes: {e}")
+            return False
+
+    def load_boxes(self) -> Optional[list]:
+        """Load boxes from session directory"""
+        try:
+            if os.path.exists(self.boxes_file):
+                with open(self.boxes_file, 'r') as f:
+                    boxes = json.load(f)
+                if len(boxes) > 0:
+                    print(f"Loaded {len(boxes)} boxes from session")
+                return boxes
+        except Exception as e:
+            print(f"Error loading boxes: {e}")
+        return None
     
     # ==================== CONVENIENCE METHODS ====================
     
@@ -379,15 +404,16 @@ class SettingsManager:
 
     def session_exists(self) -> bool:
         """Check if a session exists in temp directory"""
-        return (os.path.exists(self.session_settings_file) or 
+        return (os.path.exists(self.session_settings_file) or
                 os.path.exists(self.points_file) or
+                os.path.exists(self.boxes_file) or
                 (os.path.exists(self.temp_dir) and os.path.exists(os.path.join(self.temp_dir, "frames"))))
     
     def clear_session(self) -> bool:
         """Clear current session data"""
         try:
             # Remove session files
-            files_to_remove = [self.session_settings_file, self.points_file]
+            files_to_remove = [self.session_settings_file, self.points_file, self.boxes_file]
             for file_path in files_to_remove:
                 if os.path.exists(file_path):
                     os.remove(file_path)
@@ -403,11 +429,12 @@ class SettingsManager:
     # ==================== IMPORT/EXPORT ====================
     
     def export_session(self, export_path: str) -> bool:
-        """Export current session (settings + points) to a file"""
+        """Export current session (settings + points + boxes) to a file"""
         try:
             export_data = {
                 'session_settings': asdict(self.session_settings),
-                'points': self.load_points() or []
+                'points': self.load_points() or [],
+                'boxes': self.load_boxes() or []
             }
             
             with open(export_path, 'w') as f:
@@ -433,6 +460,10 @@ class SettingsManager:
             # Save points separately
             if 'points' in data:
                 self.save_points(data['points'])
+
+            # Save boxes separately (optional for backward compat)
+            if 'boxes' in data:
+                self.save_boxes(data['boxes'])
             
             # Save the imported session
             self.save_session_settings()
