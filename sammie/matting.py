@@ -10,6 +10,7 @@ from PySide6.QtCore import Qt
 from sammie import core
 from sammie.settings_manager import get_settings_manager
 from sammie.model_downloader import ensure_models
+from sammie.workers import MattingWorker
 
 
 class MattingManager:
@@ -24,6 +25,8 @@ class MattingManager:
         self.processor = None
         self.propagated = False  # whether we have propagated the mattes
         self.callbacks = []
+        self._worker = None  # Current MattingWorker (if any)
+        self._busy = False  # True while a worker is running
 
     def add_callback(self, callback):
         """Add callback for matting events"""
@@ -41,6 +44,38 @@ class MattingManager:
                 print(f"Callback error: {e}")
             except Exception as e:
                 print(f"Callback error: {e}")
+
+    @property
+    def is_busy(self):
+        """True while a background worker is running."""
+        return self._busy
+
+    def cancel_matting(self):
+        """Request cancellation of the current matting worker."""
+        if self._worker is not None:
+            self._worker.request_cancel()
+
+    def _on_matting_finished(self, result):
+        """Handle matting worker completion."""
+        self._busy = False
+        cancelled = result.get('cancelled', False)
+        propagated = result.get('propagated', False)
+
+        if not cancelled:
+            self.propagated = propagated
+            print("Matting completed")
+        else:
+            self.propagated = False
+            print("Matting cancelled")
+
+        self._notify('matting_complete', cancelled=cancelled)
+
+    def _on_matting_error(self, error_msg):
+        """Handle matting worker error."""
+        self._busy = False
+        self.propagated = False
+        print(f"Matting error: {error_msg}")
+        self._notify('matting_error', error=error_msg)
 
     def _prepare_device(self, load_to_cpu=False):
         """Return the appropriate torch device and clear cache"""
@@ -227,136 +262,34 @@ class MatAnyManager(MattingManager):
         """
         Run matting on all frames, using multiple keyframes for each object.
 
+        Dispatches to a background MattingWorker. Returns immediately.
+        Emits 'matting_complete' or 'matting_error' via callbacks when done.
+
         Args:
             points_list (list): List of point dictionaries containing object_id and frame information
-            parent_window: Parent window for progress dialog
+            parent_window: Parent window for progress dialog (unused in async mode)
 
         Returns:
-            int: 1 if successful, 0 if cancelled/failed
+            int: 1 if dispatched successfully, 0 if failed to dispatch
         """
+        if self._busy:
+            print("Matting already in progress")
+            return 0
+
         if self.processor is None:
             print("Matting model not loaded")
             return 0
 
-        core.DeviceManager.clear_cache()
-        device = core.DeviceManager.get_device()
-        frame_count = core.VideoInfo.total_frames
-
-        start_frame, end_frame, frames_to_process = self._get_frame_range()
-        print(f"Processing matting from frame {start_frame} to {end_frame} ({frames_to_process} frames)")
-
-        # Get unique object IDs from points list
-        object_ids = sorted(list(set(point['object_id'] for point in points_list if 'object_id' in point)))
-        if not object_ids:
-            print("No objects found for matting")
-            return 0
-
-        # Find all keyframes for each object (within processing range)
-        object_keyframes = {}
-        for object_id in object_ids:
-            keyframes = sorted(list(set(
-                point['frame'] for point in points_list
-                if point.get('object_id') == object_id and start_frame <= point['frame'] <= end_frame
-            )))
-            if keyframes:
-                object_keyframes[object_id] = keyframes
-            else:
-                print(f"No frames found for object {object_id} in range {start_frame}-{end_frame}")
-
-        if not object_keyframes:
-            print("No valid keyframes found for any objects in the specified range")
-            return 0
-
-        # When combined mode is requested, run a single pass using the union of all
-        # object masks loaded in memory — no files are written to disk.
-        if combined and len(object_ids) > 1:
-            combine_ids = object_ids
-            earliest_keyframe = min(kf[0] for kf in object_keyframes.values())
-            object_ids = [0]
-            object_keyframes = {0: [earliest_keyframe]}
-        else:
-            combine_ids = None
-
-        # Calculate total operations for progress tracking
-        total_operations = 0
-        for object_id, keyframes in object_keyframes.items():
-            first_keyframe = keyframes[0]
-
-            # Operations before first keyframe (backward propagation to start_frame)
-            total_operations += first_keyframe - start_frame
-
-            # Operations between keyframes and after last keyframe to end_frame
-            for i in range(len(keyframes)):
-                if i == len(keyframes) - 1:
-                    total_operations += end_frame - keyframes[i] + 1
-                else:
-                    total_operations += keyframes[i + 1] - keyframes[i]
-
-        progress_dialog, pbar = self._make_progress_dialog(parent_window, total_operations)
-
-        # Create matting directory if it doesn't exist
-        os.makedirs(core.matting_dir, exist_ok=True)
-
-        # If combined mode is selected, delete any existing matting files except object 0.
-        if combined and os.path.exists(core.matting_dir):
-            for frame_dirname in os.listdir(core.matting_dir):
-                frame_dir = os.path.join(core.matting_dir, frame_dirname)
-                if os.path.isdir(frame_dir):
-                    for f in os.listdir(frame_dir):
-                        if f != "0.png":
-                            os.remove(os.path.join(frame_dir, f))
-
-        images = self._collect_image_paths(start_frame, end_frame)
-
-        operations_completed = 0
-
-        # Process each object with its keyframes
-        for object_id, keyframes in object_keyframes.items():
-            if progress_dialog.wasCanceled():
-                break
-
-            pbar.set_description(f"Object {object_id}")
-
-            # Process segments for this object
-            success = self._process_object_with_keyframes(
-                images, object_id, keyframes, end_frame + 1, device,
-                progress_dialog, operations_completed, total_operations, pbar, parent_window,
-                start_frame=start_frame, combine_ids=combine_ids
-            )
-
-            if not success:
-                break
-
-            # Update operations completed for this object
-            first_keyframe = keyframes[0]
-            operations_completed += first_keyframe - start_frame  # backward from first keyframe
-
-            for i in range(len(keyframes)):
-                if i == len(keyframes) - 1:
-                    operations_completed += end_frame - keyframes[i] + 1  # last keyframe to end
-                else:
-                    operations_completed += keyframes[i + 1] - keyframes[i]  # between keyframes
-
-        # Close tqdm progress bar
-        pbar.close()
-
-        # Final cleanup
-        core.DeviceManager.clear_cache()
-
-        if progress_dialog.wasCanceled():
-            print("Matting cancelled")
-            self.propagated = False
-            progress_dialog.close()
-            return 0
-        else:
-            progress_dialog.setValue(100)
-            if frame_count == frames_to_process:
-                self.propagated = True  # only set propagated to True if the entire video was processed
-            else:
-                self.propagated = False
-            print("Matting completed")
-            self._notify('matting_complete')
-            return 1
+        self._busy = True
+        self._worker = MattingWorker(
+            matting_manager=self,
+            points_list=points_list,
+            combined=combined,
+        )
+        self._worker.finished.connect(self._on_matting_finished)
+        self._worker.error.connect(self._on_matting_error)
+        self._worker.start()
+        return 1
 
     def _process_object_with_keyframes(self, images, object_id, keyframes, frame_count, device, progress_dialog,
                                        operations_completed, total_operations, pbar, parent_window, start_frame=0,

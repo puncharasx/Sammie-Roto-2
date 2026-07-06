@@ -1169,6 +1169,9 @@ class MainWindow(QMainWindow):
         # Connect callbacks for both managers
         self.point_manager.add_callback(self._on_points_changed)
         self.sam_manager.add_callback(self._on_segmentation_changed)
+        self.sam_manager.add_frame_done_callback(self._on_tracking_frame_done)
+        self.matany_manager.add_callback(self._on_segmentation_changed)
+        self.removal_manager.add_callback(self._on_segmentation_changed)
         
         # Initialize update checker
         self.update_checker = UpdateChecker()
@@ -2020,14 +2023,138 @@ class MainWindow(QMainWindow):
         if action == 'segmentation_complete':
             frame = kwargs.get('frame')
             current_frame = self.frame_slider.value()
-            
+
             # Only update display if this segmentation is for the current frame
             if frame == current_frame:
                 self._update_current_frame_display()
-                
+
         elif action == 'replay_complete':
             # Update display after replay is complete
             self._update_current_frame_display()
+
+        elif action == 'tracking_complete':
+            # Tracking worker finished — update UI
+            cancelled = kwargs.get('cancelled', False)
+            if cancelled:
+                # Replay points to rebuild masks after cancel
+                if self.point_manager.points:
+                    self.sam_manager.replay_points(self.point_manager.get_all_points())
+            sammie.remove_backup_mattes()
+            self.update_tracking_status()
+            self._update_current_frame_display()
+            self.settings_mgr.save_session_settings()
+            self._set_tracking_ui_enabled(True)
+
+        elif action == 'tracking_error':
+            error_msg = kwargs.get('error', 'Unknown error')
+            print(f"Tracking error: {error_msg}")
+            # Replay points to rebuild masks after error
+            if self.point_manager.points:
+                self.sam_manager.replay_points(self.point_manager.get_all_points())
+            sammie.remove_backup_mattes()
+            self.update_tracking_status()
+            self._update_current_frame_display()
+            self.settings_mgr.save_session_settings()
+            self._set_tracking_ui_enabled(True)
+
+        elif action == 'matting_complete':
+            # Matting worker finished — update UI and cleanup
+            cancelled = kwargs.get('cancelled', False)
+            self.update_matting_status()
+            self._update_current_frame_display()
+            self.settings_mgr.save_session_settings()
+            # Unload matting model and reload SAM to device
+            self.matany_manager.unload_matting_model()
+            self.sam_manager.load_model_to_device()
+            self._set_matting_ui_enabled(True)
+
+        elif action == 'matting_error':
+            error_msg = kwargs.get('error', 'Unknown error')
+            print(f"Matting error: {error_msg}")
+            self.update_matting_status()
+            self._update_current_frame_display()
+            self.settings_mgr.save_session_settings()
+            # Unload matting model and reload SAM to device
+            self.matany_manager.unload_matting_model()
+            self.sam_manager.load_model_to_device()
+            self._set_matting_ui_enabled(True)
+
+        elif action == 'removal_complete':
+            # Removal worker finished — update UI
+            cancelled = kwargs.get('cancelled', False)
+            self.update_removal_status()
+            self._update_current_frame_display()
+            self.settings_mgr.save_session_settings()
+            self._set_removal_ui_enabled(True)
+
+        elif action == 'removal_error':
+            error_msg = kwargs.get('error', 'Unknown error')
+            print(f"Removal error: {error_msg}")
+            self.update_removal_status()
+            self._update_current_frame_display()
+            self.settings_mgr.save_session_settings()
+            self._set_removal_ui_enabled(True)
+
+    def _set_tracking_ui_enabled(self, enabled):
+        """Enable or disable tracking-related UI elements.
+
+        When tracking is running (enabled=False), disable buttons and prompt
+        input to prevent re-entrancy and ensure no two threads touch
+        inference_state concurrently.
+        """
+        if hasattr(self, 'segmentation_tab'):
+            self.segmentation_tab.track_objects_btn.setEnabled(enabled)
+            self.segmentation_tab.track_forward_btn.setEnabled(enabled)
+            self.segmentation_tab.track_backward_btn.setEnabled(enabled)
+            # Also disable single-frame step buttons to prevent inference_state contention
+            if hasattr(self.segmentation_tab, 'track_one_frame_forward_btn'):
+                self.segmentation_tab.track_one_frame_forward_btn.setEnabled(enabled)
+            if hasattr(self.segmentation_tab, 'track_one_frame_backward_btn'):
+                self.segmentation_tab.track_one_frame_backward_btn.setEnabled(enabled)
+
+        # Disable point/box input while tracking
+        if hasattr(self, 'viewer'):
+            self.viewer.setEnabled(enabled)
+
+        # Show/hide cancel button and progress label in status bar
+        if not enabled:
+            if not hasattr(self, '_tracking_cancel_btn'):
+                from PySide6.QtWidgets import QPushButton, QLabel
+                self._tracking_progress_label = QLabel("Tracking: 0%")
+                self.statusBar().addPermanentWidget(self._tracking_progress_label)
+                self._tracking_cancel_btn = QPushButton("Cancel Tracking")
+                self._tracking_cancel_btn.clicked.connect(self._cancel_tracking)
+                self.statusBar().addPermanentWidget(self._tracking_cancel_btn)
+
+            # Always reconnect progress signal to current worker (handles first run + subsequent runs)
+            if self.sam_manager._worker is not None:
+                try:
+                    self.sam_manager._worker.progress.disconnect()
+                except (RuntimeError, TypeError):
+                    pass  # No previous connection
+                self.sam_manager._worker.progress.connect(
+                    lambda p: self._tracking_progress_label.setText(f"Tracking: {p}%")
+                )
+
+            self._tracking_progress_label.setText("Tracking: 0%")
+            self._tracking_progress_label.show()
+            self._tracking_cancel_btn.show()
+        else:
+            if hasattr(self, '_tracking_progress_label'):
+                self._tracking_progress_label.hide()
+            if hasattr(self, '_tracking_cancel_btn'):
+                self._tracking_cancel_btn.hide()
+
+    def _cancel_tracking(self):
+        """Cancel the current tracking operation."""
+        self.sam_manager.cancel_tracking()
+
+    def _on_tracking_frame_done(self, frame_idx):
+        """Nudge the frame slider to the latest processed frame."""
+        try:
+            self.frame_slider.setValue(frame_idx)
+        except Exception as e:
+            print(f"Error updating frame slider: {e}")
 
     def _update_current_frame_display(self, preview_mask=None):
         """Update the current frame display with masks and points"""
@@ -2292,53 +2419,49 @@ class MainWindow(QMainWindow):
             print("Failed to load segmentation model")
 
     def track_objects(self):
-        """Run object tracking using current points"""
+        """Run object tracking using current points.
+
+        Dispatches to a background worker. UI is disabled until tracking completes.
+        Post-tracking logic is handled in _on_segmentation_changed('tracking_complete').
+        """
         self.settings_mgr.save_session_settings()
         count = len(self.point_manager.points)
-        if count > 0:            
+        if count > 0:
             self.sam_manager.replay_points(self.point_manager.get_all_points())
-            if self.sam_manager.track_objects(parent_window=self) == 0: # if cancelled
-                self.sam_manager.replay_points(self.point_manager.get_all_points())
-            else: # completed
-                pass
-            sammie.remove_backup_mattes() # Make sure to remove an existing mattes backup folder
-            self.update_tracking_status()
-            self._update_current_frame_display()
-            self.settings_mgr.save_session_settings()
+            self._set_tracking_ui_enabled(False)
+            self.sam_manager.track_objects(parent_window=self)
         else:
-            # If no points, just update display
             print("Points must be added before tracking")
             self._update_current_frame_display()
-    
+
     def track_forward(self):
-        """Track objects forward from the current frame to the out point (or end of video)"""
+        """Track objects forward from the current frame to the out point (or end of video).
+
+        Dispatches to a background worker. UI is disabled until tracking completes.
+        """
         self.settings_mgr.save_session_settings()
         count = len(self.point_manager.points)
         if count > 0:
             self.sam_manager.replay_points(self.point_manager.get_all_points())
             current_frame = self.frame_slider.value()
-            if self.sam_manager.track_forward(parent_window=self, current_frame=current_frame) == 0: # if cancelled
-                self.sam_manager.replay_points(self.point_manager.get_all_points())
-            sammie.remove_backup_mattes() # Make sure to remove an existing mattes backup folder
-            self.update_tracking_status()
-            self._update_current_frame_display()
-            self.settings_mgr.save_session_settings()
+            self._set_tracking_ui_enabled(False)
+            self.sam_manager.track_forward(parent_window=self, current_frame=current_frame)
         else:
             print("Points must be added before tracking")
             self._update_current_frame_display()
 
     def track_backward(self):
-        """Track objects backward from the current frame to the in point (or start of video)"""
+        """Track objects backward from the current frame to the in point (or start of video).
+
+        Dispatches to a background worker. UI is disabled until tracking completes.
+        """
         self.settings_mgr.save_session_settings()
         count = len(self.point_manager.points)
         if count > 0:
             self.sam_manager.replay_points(self.point_manager.get_all_points())
             current_frame = self.frame_slider.value()
-            if self.sam_manager.track_backward(parent_window=self, current_frame=current_frame) == 0: # if cancelled
-                self.sam_manager.replay_points(self.point_manager.get_all_points())
-            sammie.remove_backup_mattes() # Make sure to remove an existing mattes backup folder
-            self.update_tracking_status()
-            self._update_current_frame_display()
+            self._set_tracking_ui_enabled(False)
+            self.sam_manager.track_backward(parent_window=self, current_frame=current_frame)
             self.settings_mgr.save_session_settings()
         else:
             print("Points must be added before tracking")
@@ -2422,73 +2545,163 @@ class MainWindow(QMainWindow):
         self.settings_mgr.save_session_settings()
 
     def run_matting(self):
-        """Run matting process"""
+        """Run matting process.
+
+        Loads the matting model synchronously, then dispatches the matting
+        loop to a background worker. Post-matting cleanup happens in the
+        _on_segmentation_changed('matting_complete') callback.
+        """
         self.settings_mgr.save_session_settings()
         count = len(self.point_manager.points)
         matting_model = self.settings_mgr.get_session_setting("matany_model", "MatAnyone2")
-        combined=self.settings_mgr.get_session_setting("matany_combined", False)
+        combined = self.settings_mgr.get_session_setting("matany_combined", False)
 
         # Don't allow VideoMama on CPU
         if core.DeviceManager.get_device().type == 'cpu' and matting_model == 'VideoMaMa':
-            show_message_dialog(self, title="Error" , message="VideoMaMa is not supported on CPU. Please use MatAnyone instead.", type="warning")
+            show_message_dialog(self, title="Error", message="VideoMaMa is not supported on CPU. Please use MatAnyone instead.", type="warning")
             return
 
-        if count > 0:  
-            #load models
+        if count > 0:
+            # Load models synchronously (this is fast enough to stay on GUI thread)
             print(f"Loading {matting_model} model...")
-            QApplication.processEvents()
             self.sam_manager.offload_model_to_cpu()
-            if self.matany_manager.BACKEND != matting_model: # if the existing matting manager backend is wrong, create a new one
+            if self.matany_manager.BACKEND != matting_model:
                 self.matany_manager = matting.create_matting_manager()
-            if not self.matany_manager.load_matting_model(parent_window=self): # load matting model
-                print(f"Failed to load { matting_model} model")
+            if not self.matany_manager.load_matting_model(parent_window=self):
+                print(f"Failed to load {matting_model} model")
+                self.sam_manager.load_model_to_device()
                 return
-            QApplication.processEvents()
+
+            # Disable UI while matting runs
+            self._set_matting_ui_enabled(False)
+
+            # Dispatch matting to background worker
             try:
                 self.matany_manager.run_matting(self.point_manager.points, parent_window=self, combined=combined)
             except Exception as e:
                 if "out of memory" in str(e):
-                    show_message_dialog(self, title="Error", message="An out of memory error occurred. Please try again with lower settings." , type="warning")
-                else: 
+                    show_message_dialog(self, title="Error", message="An out of memory error occurred. Please try again with lower settings.", type="warning")
+                else:
                     print(f"An error occurred: {e}")
-            finally:
-                self.update_matting_status()
-                self._update_current_frame_display()
-                QApplication.processEvents()
-                self.settings_mgr.save_session_settings()
+                self._set_matting_ui_enabled(True)
                 self.matany_manager.unload_matting_model()
                 self.sam_manager.load_model_to_device()
         else:
             print("Points must be added on the Segmentation tab before matting")
 
-    def run_object_removal(self):
-        """Run object removal process"""
+    def _set_matting_ui_enabled(self, enabled):
+        """Enable or disable matting-related UI elements."""
+        if hasattr(self, 'matting_tab'):
+            self.matting_tab.run_matting_btn.setEnabled(enabled)
 
+        # Show/hide cancel button and progress label in status bar
+        if not enabled:
+            if not hasattr(self, '_matting_cancel_btn'):
+                from PySide6.QtWidgets import QPushButton, QLabel
+                self._matting_progress_label = QLabel("Matting: 0%")
+                self.statusBar().addPermanentWidget(self._matting_progress_label)
+                self._matting_cancel_btn = QPushButton("Cancel Matting")
+                self._matting_cancel_btn.clicked.connect(self._cancel_matting)
+                self.statusBar().addPermanentWidget(self._matting_cancel_btn)
+
+            # Always reconnect progress signal to current worker
+            if self.matany_manager._worker is not None:
+                try:
+                    self.matany_manager._worker.progress.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+                self.matany_manager._worker.progress.connect(
+                    lambda p: self._matting_progress_label.setText(f"Matting: {p}%")
+                )
+
+            self._matting_progress_label.setText("Matting: 0%")
+            self._matting_progress_label.show()
+            self._matting_cancel_btn.show()
+        else:
+            if hasattr(self, '_matting_progress_label'):
+                self._matting_progress_label.hide()
+            if hasattr(self, '_matting_cancel_btn'):
+                self._matting_cancel_btn.hide()
+
+    def _cancel_matting(self):
+        """Cancel the current matting operation."""
+        self.matany_manager.cancel_matting()
+
+    def run_object_removal(self):
+        """Run object removal process.
+
+        For OpenCV method: dispatches to a background worker.
+        For MiniMax method: runs synchronously (internal processEvents are out of scope).
+        Post-removal cleanup happens in _on_segmentation_changed('removal_complete').
+        """
         # Don't allow minimax-remover on CPU
         if core.DeviceManager.get_device().type == 'cpu' and self.removal_tab.method_combo.currentText() == 'MiniMax-Remover':
-            show_message_dialog(self, title="Error" , message="MiniMax-Remover is not supported on CPU. Please use OpenCV instead.", type="warning")
+            show_message_dialog(self, title="Error", message="MiniMax-Remover is not supported on CPU. Please use OpenCV instead.", type="warning")
             return
         self.settings_mgr.save_session_settings()
-        
+
         if self.removal_tab.method_combo.currentText() == 'MiniMax-Remover':
+            # MiniMax runs synchronously (internal processEvents are out of scope)
             try:
-                # offload sam model
                 self.sam_manager.offload_model_to_cpu()
                 self.removal_manager.run_object_removal_minimax(self.point_manager.points, parent_window=self)
             except Exception as e:
                 if "out of memory" in str(e):
-                    show_message_dialog(self, title="Error", message="An out of memory error occurred. Please try again with lower settings." , type="warning")
-                else: 
+                    show_message_dialog(self, title="Error", message="An out of memory error occurred. Please try again with lower settings.", type="warning")
+                else:
                     print(f"An error occurred: {e}")
             finally:
-                self.removal_manager.unload_minimax_model()    
+                self.removal_manager.unload_minimax_model()
                 self.sam_manager.load_model_to_device()
+            self.update_removal_status()
+            self._update_current_frame_display()
+            self.settings_mgr.save_session_settings()
         else:
-            self.removal_manager.run_object_removal_cv(self.point_manager.points, parent_window=self)
+            # OpenCV method dispatches to background worker
+            self._set_removal_ui_enabled(False)
+            try:
+                self.removal_manager.run_object_removal_cv(self.point_manager.points, parent_window=self)
+            except Exception as e:
+                print(f"Failed to start removal: {e}")
+                self._set_removal_ui_enabled(True)
 
-        self.update_removal_status()
-        self._update_current_frame_display()
-        self.settings_mgr.save_session_settings()
+    def _set_removal_ui_enabled(self, enabled):
+        """Enable or disable removal-related UI elements."""
+        if hasattr(self, 'removal_tab'):
+            self.removal_tab.run_removal_btn.setEnabled(enabled)
+
+        # Show/hide cancel button and progress label in status bar
+        if not enabled:
+            if not hasattr(self, '_removal_cancel_btn'):
+                from PySide6.QtWidgets import QPushButton, QLabel
+                self._removal_progress_label = QLabel("Removal: 0%")
+                self.statusBar().addPermanentWidget(self._removal_progress_label)
+                self._removal_cancel_btn = QPushButton("Cancel Removal")
+                self._removal_cancel_btn.clicked.connect(self._cancel_removal)
+                self.statusBar().addPermanentWidget(self._removal_cancel_btn)
+
+            # Always reconnect progress signal to current worker
+            if self.removal_manager._worker is not None:
+                try:
+                    self.removal_manager._worker.progress.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+                self.removal_manager._worker.progress.connect(
+                    lambda p: self._removal_progress_label.setText(f"Removal: {p}%")
+                )
+
+            self._removal_progress_label.setText("Removal: 0%")
+            self._removal_progress_label.show()
+            self._removal_cancel_btn.show()
+        else:
+            if hasattr(self, '_removal_progress_label'):
+                self._removal_progress_label.hide()
+            if hasattr(self, '_removal_cancel_btn'):
+                self._removal_cancel_btn.hide()
+
+    def _cancel_removal(self):
+        """Cancel the current removal operation."""
+        self.removal_manager.cancel_removal()
         
 
     def update_tracking_status(self):
