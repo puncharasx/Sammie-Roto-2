@@ -465,7 +465,7 @@ def load_smoothing_model():
 # View / display handlers
 # .........................................................................................
 
-def update_image(slider_value, view_options, points, return_numpy=False, object_id_filter=None, preview_mask=None, boxes=None):
+def update_image(slider_value, view_options, points, return_numpy=False, object_id_filter=None, preview_mask=None, boxes=None, skip_points=False):
     """Main image update function - delegates to specific view handlers
 
     Args:
@@ -475,6 +475,7 @@ def update_image(slider_value, view_options, points, return_numpy=False, object_
         return_numpy: If True, return numpy array; if False, return QPixmap
         object_id_filter: If specified, only process masks for this object ID
         boxes: List of box dictionaries (optional)
+        skip_points: If True, skip drawing points (used when DraggablePointItems are active)
 
     Returns:
         QPixmap or numpy array depending on return_numpy parameter
@@ -482,7 +483,7 @@ def update_image(slider_value, view_options, points, return_numpy=False, object_
     view_mode = view_options.get("view_mode", "Segmentation-Edit")
 
     if view_mode == "Segmentation-Edit":
-        return _handle_segmentation_edit_view(slider_value, view_options, points, return_numpy, object_id_filter, preview_mask, boxes=boxes)
+        return _handle_segmentation_edit_view(slider_value, view_options, points, return_numpy, object_id_filter, preview_mask, boxes=boxes, skip_points=skip_points)
     elif view_mode == "Segmentation-Matte":
         return _handle_segmentation_matte_view(slider_value, view_options, points, return_numpy, object_id_filter)
     elif view_mode == "Segmentation-BGcolor":
@@ -548,7 +549,7 @@ def _handle_none_view(frame_number, return_numpy=False):
         return _convert_to_qpixmap(image)
 
 
-def _handle_segmentation_edit_view(frame_number, view_options, points, return_numpy=False, object_id_filter=None, preview_mask=None, boxes=None):
+def _handle_segmentation_edit_view(frame_number, view_options, points, return_numpy=False, object_id_filter=None, preview_mask=None, boxes=None, skip_points=False):
     """Handle Segmentation-Edit view"""
     image = core.load_base_frame(frame_number)
     if image is None:
@@ -556,16 +557,17 @@ def _handle_segmentation_edit_view(frame_number, view_options, points, return_nu
 
     image = apply_postprocessing_to_display(image, frame_number, points, view_options, object_id_filter, preview_mask)
 
-    highlighted_points = view_options.get('highlighted_point', None)
+    if not skip_points:
+        highlighted_points = view_options.get('highlighted_point', None)
 
-    if highlighted_points is None:
-        highlighted_points = None
-    elif isinstance(highlighted_points, list):
-        highlighted_points = highlighted_points.copy()
-    else:
-        highlighted_points = [highlighted_points]
+        if highlighted_points is None:
+            highlighted_points = None
+        elif isinstance(highlighted_points, list):
+            highlighted_points = highlighted_points.copy()
+        else:
+            highlighted_points = [highlighted_points]
 
-    image = draw_points(image, frame_number, points, highlighted_points)
+        image = draw_points(image, frame_number, points, highlighted_points)
     if boxes:
         image = draw_boxes(image, frame_number, boxes)
 

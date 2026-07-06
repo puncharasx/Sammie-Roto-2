@@ -162,6 +162,23 @@ class PointManager:
             return point
         return None
 
+    def move_point(self, frame, object_id, old_x, old_y, new_x, new_y):
+        """Move a point to new coordinates. Returns updated point or None if not found."""
+        for point in self.points:
+            if (point['frame'] == frame and
+                point['object_id'] == object_id and
+                point['x'] == old_x and
+                point['y'] == old_y):
+                point['x'] = new_x
+                point['y'] = new_y
+                settings_mgr = get_settings_manager()
+                settings_mgr.save_points(self.points)
+                self._notify('move_point', point=point,
+                             old_x=old_x, old_y=old_y,
+                             new_x=new_x, new_y=new_y)
+                return point
+        return None
+
     def clear_all(self):
         """Clear all points and boxes"""
         had_data = bool(self.points or self.boxes)

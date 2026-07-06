@@ -1265,6 +1265,7 @@ class MainWindow(QMainWindow):
         self.viewer.preview_requested.connect(self.on_preview_requested)
         self.viewer.preview_cancelled.connect(self.on_preview_cancelled)
         self.viewer.box_drawn.connect(self.add_box_from_drag)
+        self.viewer.point_moved.connect(self._on_point_moved)
 
         # Connect image viewer file drops to file loading
         self.viewer.file_dropped.connect(self.handle_dropped_file)
@@ -1922,6 +1923,11 @@ class MainWindow(QMainWindow):
                 self._mark_tracking_stale()
                 # No image update here - wait for segmentation to complete
 
+        elif action == 'move_point':
+            # Table sync after point drag — re-segment handled by _on_point_moved
+            self._refresh_table()
+            self._mark_tracking_stale()
+
         elif action == 'clear_frame':
             points = self.point_manager.get_all_points()
             # Don't clear tracking - just replay points
@@ -1961,7 +1967,21 @@ class MainWindow(QMainWindow):
         self.update_tracking_status()
         self.update_matting_status()
         self.update_removal_status()
-    
+
+    def _on_point_moved(self, point_data, new_x, new_y):
+        """Handle point drag release: update model, re-segment, sync table"""
+        frame = point_data['frame']
+        object_id = point_data['object_id']
+        old_x, old_y = point_data['x'], point_data['y']
+
+        # Update data model (triggers 'move_point' callback → _refresh_table)
+        self.point_manager.move_point(frame, object_id, old_x, old_y, new_x, new_y)
+
+        # Re-segment this frame/object with updated coordinates
+        coordinates, labels = self.point_manager.get_sam2_points(frame, object_id)
+        box = self.point_manager.get_sam2_box(frame, object_id)
+        self.sam_manager.segment_image(frame, object_id, coordinates, labels, box=box)
+
     def _on_point_selected(self, point_data):
         """Handle point selection from table"""
         if point_data:
@@ -2015,13 +2035,34 @@ class MainWindow(QMainWindow):
             return  # Don't try to update before video is loaded
         current_frame = self.frame_slider.value()
         view_options = self.get_view_options()
+        view_mode = view_options.get("view_mode", "Segmentation-Edit")
         object_id = self.sidebar.segmentation_tab.get_selected_object_id() if preview_mask is not None else None
+
+        # Skip baked point drawing in Segmentation-Edit (DraggablePointItems handle it)
+        use_draggable = (view_mode == "Segmentation-Edit" and self.viewer.original_pixmap)
         updated_image = sammie.update_image(
             current_frame, view_options, self.point_manager.points,
             object_id_filter=object_id, preview_mask=preview_mask,
-            boxes=self.point_manager.boxes)
+            boxes=self.point_manager.boxes,
+            skip_points=use_draggable)
         if updated_image:
             self.viewer.update_image(updated_image)
+
+        # Draggable points: only in Segmentation-Edit view
+        if use_draggable:
+            image_size = (self.viewer.original_pixmap.width(),
+                          self.viewer.original_pixmap.height())
+            self.viewer.set_draggable_points(
+                self.point_manager.points, current_frame, image_size)
+            # Restore highlight from table selection
+            if hasattr(self, 'highlighted_point') and self.highlighted_point:
+                hp = self.highlighted_point
+                if isinstance(hp, list):
+                    hp = hp[-1] if hp else None
+                if hp:
+                    self.viewer.set_highlighted_point(hp)
+        else:
+            self.viewer.clear_draggable_points()
             
     def _refresh_table(self):
         """Rebuild table from point manager data"""
